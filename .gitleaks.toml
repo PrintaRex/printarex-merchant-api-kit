@@ -1,0 +1,16 @@
+# Default gitleaks rules plus PrintaRex key formats. Sandbox values are generated at
+# runtime and never committed, so no allowlist is needed for them.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "printarex-api-key"
+description = "PrintaRex Merchant API key"
+regex = '''prx_[a-z]+_[A-Za-z0-9_-]{43}'''
+keywords = ["prx_"]
+
+[[rules]]
+id = "printarex-webhook-secret"
+description = "PrintaRex webhook signing secret"
+regex = '''whsec_[A-Za-z0-9_-]{43}'''
+keywords = ["whsec_"]

@@ -1,0 +1,55 @@
+name: Release sandbox image
+
+# Push a tag such as sandbox-v1.0.0 to publish ghcr.io/printarex/printarex-merchant-api-sandbox:1.0.0 and :latest.
+# The tests run first; the image is published only if they pass.
+on:
+  push:
+    tags: ['sandbox-v*']
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    # The same typecheck, sandbox tests, contract parity and starter tests as CI.
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Image name and version
+        id: meta
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/printarex-merchant-api-sandbox" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#sandbox-v}" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: sandbox/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # Build attestations stored next to the image in the registry.
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
+            ${{ steps.meta.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=PrintaRex Merchant API sandbox

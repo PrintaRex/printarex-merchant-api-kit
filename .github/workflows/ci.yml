@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Typecheck and end-to-end tests
+    runs-on: ubuntu-latest
+    container: node:24-alpine@sha256:44fce696f38ba8c987c4db89954051000bbd05ffd8d8659ba15ed4a8602e937f
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install dev tools (TypeScript only; there are no runtime dependencies)
+        run: |
+          (cd sandbox && npm ci --no-audit --no-fund)
+          (cd starter && npm ci --no-audit --no-fund)
+      - name: Typecheck
+        run: |
+          (cd sandbox && npx tsc --noEmit -p .)
+          (cd starter && npx tsc --noEmit -p .)
+      - name: Prepare the report folder
+        run: mkdir -p artifacts
+      - name: Contract parity (sandbox against the OpenAPI document)
+        working-directory: sandbox
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=../artifacts/contract-parity-junit.xml test/contract-parity.test.ts
+      - name: Sandbox end-to-end tests (every test file except the parity check)
+        if: ${{ !cancelled() }}
+        working-directory: sandbox
+        run: |
+          # A search instead of a fixed list, so new test files are picked up on their own.
+          test_files=$(find test -name '*.test.ts' ! -name 'contract-parity.test.ts' | sort)
+          node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=../artifacts/sandbox-e2e-junit.xml $test_files
+      - name: Starter end-to-end tests (against the sandbox)
+        if: ${{ !cancelled() }}
+        working-directory: starter
+        env:
+          ARTIFACTS_DIR: ${{ github.workspace }}/artifacts
+        run: node --test --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=../artifacts/starter-e2e-junit.xml "test/**/*.test.ts"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: e2e-results
+          path: artifacts/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: contract-parity-report
+          path: artifacts/contract-parity-junit.xml
+          if-no-files-found: warn
+
+  images:
+    name: Build images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -f sandbox/Dockerfile -t printarex-merchant-api-sandbox:ci .
+      - run: docker build -f starter/Dockerfile -t merchant-starter:ci .
+      - name: Sandbox image answers its health check
+        run: |
+          docker run -d --name sandbox -p 127.0.0.1:8080:8080 printarex-merchant-api-sandbox:ci
+          for attempt in $(seq 1 20); do curl -fs http://localhost:8080/healthz && exit 0; sleep 1; done
+          docker logs sandbox; exit 1

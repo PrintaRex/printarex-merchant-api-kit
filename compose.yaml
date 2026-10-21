@@ -1,0 +1,41 @@
+# Runs the sandbox and the starter shop together.
+# Start with ./scripts/dev-up.sh, which creates the keys and secrets for this run.
+# Ports bind to 127.0.0.1 because the /_sandbox/* control endpoints have no authentication:
+# nobody else on your network may reach them.
+services:
+  sandbox:
+    build:
+      context: .
+      dockerfile: sandbox/Dockerfile
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # The starter downloads images server-side, so links use the in-network name;
+      # portal pages (hold action links) open in your browser.
+      SANDBOX_PUBLIC_BASE_URL: http://sandbox:8080
+      SANDBOX_PORTAL_BASE_URL: http://localhost:8080
+      SANDBOX_API_KEY: ${SANDBOX_API_KEY:?Run ./scripts/dev-up.sh}
+      SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:?Run ./scripts/dev-up.sh}
+      SANDBOX_WEBHOOK_URL: http://starter:3000/webhooks/printarex
+
+  starter:
+    build:
+      context: .
+      dockerfile: starter/Dockerfile
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      PRINTAREX_API_BASE_URL: http://sandbox:8080/merchant/v1
+      PRINTAREX_API_KEY: ${SANDBOX_API_KEY:?Run ./scripts/dev-up.sh}
+      PRINTAREX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:?Run ./scripts/dev-up.sh}
+      STOREFRONT_BASE_URL: https://shop.example
+      STARTER_SESSION_SECRET: ${STARTER_SESSION_SECRET:?Run ./scripts/dev-up.sh}
+      STARTER_ADMIN_TOKEN: ${STARTER_ADMIN_TOKEN:?Run ./scripts/dev-up.sh}
+    volumes:
+      - starter-data:/data
+    depends_on:
+      sandbox:
+        condition: service_healthy
+
+volumes:
+  starter-data:

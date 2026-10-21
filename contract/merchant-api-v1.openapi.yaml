@@ -1,0 +1,2550 @@
+openapi: 3.1.0
+info:
+  title: PrintaRex Merchant API (Custom Website sales channel)
+  version: 1.0.0
+  summary: Connect your own website to PrintaRex, publish products, quote shipping, push paid orders and receive status back.
+  contact:
+    name: PrintaRex developer support
+  license:
+    name: PrintaRex API terms
+    url: https://printarex.com/terms
+  description: |
+    The Merchant API lets a website that is not Shopify, WooCommerce, Amazon or Noon
+    sell PrintaRex products. It is available on the **Premium** plan only.
+
+    ## Integration guide
+
+    1. **Connect.** In the PrintaRex customer portal, add a *Custom Website* store
+       (name, website URL, webhook URL, country, currency). Live stores are AE / AED
+       only until other payment rails launch.
+    2. **Keys.** Create an API key in the store's *Developers* tab. Creating
+       or rotating a key needs an extra account check (step-up). The key is shown in
+       full when it is created or rotated, and the store owner can reveal an active key
+       again in the portal after a fresh step-up check (a revoked, expired or rotated-out
+       key cannot be revealed; rotate the current key instead). Only the current active
+       key can be rotated: a key already rotated out (still valid during its overlap
+       window) cannot be rotated again. Reveal is a portal action only: the
+       Merchant API has no endpoint that returns a key. Keys start with `prx_live_` (production) or `prx_uat_` (UAT) and are
+       sent only as `Authorization: Bearer <key>`, never in a query string. Keys expire
+       after 12 months; you get `api_key.expiring` 30 and 7 days before.
+    3. **Verify webhooks.** Every webhook carries `PrintaRex-Signature: t=<unix>,v1=<hex>`
+       where `v1 = HMAC-SHA256(secret, "<t>.<raw body>")`. Reject a timestamp older
+       than 5 minutes. During a secret rotation two `v1=` values are sent (current
+       and previous secret); accept the request if either matches. Answer with any
+       2xx within 10 seconds, then process asynchronously. Use `POST /webhooks/test`
+       to receive a correctly signed sample of any event.
+    4. **Publish handshake.** The merchant designs and publishes in the PrintaRex
+       studio. You receive `product.publish_requested` (primary image first) and
+       later `product.updated{changed:[images]}` for the gallery. Download and host
+       the images yourself: our links are signed and expire. Then call
+       `POST /products/{id}/confirmation` with your own product id and URL, or
+       `POST /products/{id}/publish-failure` with a reason. Listings that stay
+       unconfirmed become `unconfirmed`.
+    5. **Rates.** At checkout call `POST /shipping/rates`. Rates are an **estimate of
+       the PrintaRex shipping cost, not the final charge**; the charged amount is in
+       `order.costs` and the `order.charged` webhook. If the rates call fails, do not
+       invent a price.
+    6. **Orders.** Push only orders the buyer has **paid** (`payment_status: paid`;
+       cash on delivery and unpaid orders are not accepted in v1).
+       `external_order_id` is the idempotency key: re-sending the same body returns
+       the same order (200); a different body returns `409 idempotency_key_reuse`.
+    7. **Status.** Track orders through webhooks (`order.status_changed`,
+       `order.shipped`, ...) or `GET /orders/{id}`. Delivery is at-least-once and
+       unordered: drop any event whose `sequence` is LOWER than the one you
+       stored for that resource (several events from one change share a sequence). Statuses are **not monotonic** (an admin can move
+       `delivered` back to `shipped`).
+
+    ## Formats
+
+    - Money: decimal strings plus an ISO 4217 currency (`"49.00"`, `"AED"`). An
+      unknown amount is `null`, never `"0.00"`.
+    - Timestamps: RFC 3339 (`2026-10-19T08:30:00Z`). Phones: E.164.
+    - Open enums are marked `x-extensible-enum`. **Clients must tolerate values they
+      do not know** (treat an unknown order status as "in progress").
+    - Ids are opaque strings. Product ids start with `prd_` and variant ids with
+      `var_`; do not parse any id.
+
+    ## Errors
+
+    Every error uses the envelope `{code, message, field, request_id}`. `code` is
+    stable lower_snake; `message` is for humans and may change. Quote `request_id`
+    (also in the `X-Request-Id` header) to support.
+
+    ## Versioning
+
+    - Breaking changes get a new path major (`/merchant/v2`). Additive changes
+      (new fields, new enum values, new event types) ship inside `/v1`.
+    - Every response carries `PrintaRex-Api-Version`. A version scheduled for removal
+      is announced with `Deprecation` and `Sunset` headers and in the changelog, and
+      stays supported for at least 12 months after deprecation.
+    - The OpenAPI file is diff-checked in CI.
+
+    ## Rate limits
+
+    Proposed per-key totals: 120 requests/min general, 60/min for `POST /orders`,
+    300/min for `POST /shipping/rates`. Over the limit you get `429 rate_limited`
+    with `Retry-After`. New keys of every environment (UAT included) also have
+    order velocity caps (`429 velocity_cap`).
+
+servers:
+  - url: https://api.printarex.com/merchant/v1
+    description: Production. Use `prx_live_` keys.
+  - url: https://uat-api.printarex.com/merchant/v1
+    description: UAT (test with PrintaRex before going live; payments run in test mode). Use `prx_uat_` keys.
+
+security:
+  - merchantApiKey: []
+
+tags:
+  - name: Store
+    description: The store the API key belongs to.
+  - name: Products
+    description: Products published by the merchant from the PrintaRex studio, and the website's publish handshake.
+  - name: Shipping
+    description: Shipping estimates and covered destinations.
+  - name: Orders
+    description: Paid orders pushed by the website, and their status.
+  - name: Webhooks
+    description: Webhook delivery log, replay and test events.
+
+paths:
+  /store:
+    get:
+      operationId: getStore
+      tags: [Store]
+      summary: Get the store of this key
+      description: Returns the store connection bound to the API key. Required scope `store:read`.
+      x-required-scope: store:read
+      security:
+        - merchantApiKey: ["store:read"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      responses:
+        '200':
+          description: The store.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Store' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /products:
+    get:
+      operationId: listProducts
+      tags: [Products]
+      summary: List published products
+      description: |
+        Lists the store's products, newest change first. Required scope `products:read`.
+        Pagination is cursor based.
+      x-required-scope: products:read
+      security:
+        - merchantApiKey: ["products:read"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: listing_state
+          in: query
+          required: false
+          description: Filter by website listing state.
+          schema: { $ref: '#/components/schemas/ListingState' }
+        - name: updated_since
+          in: query
+          required: false
+          description: Only products whose public output changed at or after this time.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: A page of products.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProductPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /products/{product_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    get:
+      operationId: getProduct
+      tags: [Products]
+      summary: Get one product
+      description: |
+        The full product, including the merchant's cost block. Image links are
+        signed and expire; download and host them. Required scope `products:read`.
+      x-required-scope: products:read
+      security:
+        - merchantApiKey: ["products:read"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      responses:
+        '200':
+          description: The product.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /products/{product_id}/confirmation:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    post:
+      operationId: confirmProduct
+      tags: [Products]
+      summary: Confirm the product is live on the website
+      description: |
+        Stores the website's own product id and URL (`website_product_id`, `website_url`)
+        and sets `listing_state` to `confirmed`. The PrintaRex ids (`prd_`, `var_`) never
+        change; orders always use them. The portal then shows "Live on your website".
+        Calling it again with new values updates them. Required scope `products:write`.
+      x-required-scope: products:write
+      security:
+        - merchantApiKey: ["products:write"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductConfirmation' }
+      responses:
+        '200':
+          description: The updated product.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /products/{product_id}/publish-failure:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    post:
+      operationId: reportProductPublishFailure
+      tags: [Products]
+      summary: Report that the website could not list the product
+      description: |
+        Sets `listing_state` to `failed`, shows the reason to the merchant and refunds
+        the monthly publish quota. A later Sync Now does not flip it back.
+        Required scope `products:write`.
+      x-required-scope: products:write
+      security:
+        - merchantApiKey: ["products:write"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PublishFailure' }
+      responses:
+        '200':
+          description: The updated product.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /products/{product_id}/removed:
+    parameters:
+      - $ref: '#/components/parameters/ProductId'
+    post:
+      operationId: reportProductRemoved
+      tags: [Products]
+      summary: Report that the website removed the product
+      description: |
+        The website took the listing down (for example after `product.unpublish_requested`,
+        or on its own). PrintaRex marks the product unpublished so design tracking stays
+        correct; new orders for it are refused with `410 variant_retired`. Required scope
+        `products:write`.
+      x-required-scope: products:write
+      security:
+        - merchantApiKey: ["products:write"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductRemoved' }
+      responses:
+        '200':
+          description: The updated product.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /inventory:
+    get:
+      operationId: getInventory
+      tags: [Products]
+      summary: Get availability for variants
+      description: |
+        Current availability of up to 100 variants. Ids that are unknown or belong to
+        another store are omitted from the result (never a 404 leak).
+        Required scope `products:read`.
+      x-required-scope: products:read
+      security:
+        - merchantApiKey: ["products:read"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+        - name: variant_ids
+          in: query
+          required: true
+          description: Comma-separated `var_` ids, at most 100.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 100
+            items: { type: string }
+      responses:
+        '200':
+          description: Availability per variant.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Inventory' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /shipping/rates:
+    post:
+      operationId: getShippingRates
+      tags: [Shipping]
+      summary: Estimate PrintaRex shipping for a cart
+      description: |
+        Returns shipping methods with an **estimated** PrintaRex shipping cost, delivery
+        days and production time for a cart and destination. This is not the final
+        charge: the charged amount comes back in `order.costs` and `order.charged`. If the
+        call fails, do not invent a price. All items must ship from one provider group
+        (`422 multi_provider_cart`). Rates are always live for this channel.
+        There is no `rate_id` and nothing expires: `POST /orders` never takes
+        a rate. Required scope `shipping:read`.
+      x-required-scope: shipping:read
+      security:
+        - merchantApiKey: ["shipping:read"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShippingRatesRequest' }
+      responses:
+        '200':
+          description: Estimated shipping methods.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ShippingRatesResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '410':
+          description: '`variant_retired`: a variant is no longer published.'
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            One of `variant_unknown` (also a variant whose listing the website reported as failed), `variant_out_of_stock`, `multi_provider_cart`,
+            `destination_uncovered`, `address_invalid`, `validation_failed`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /shipping/coverage:
+    get:
+      operationId: getShippingCoverage
+      tags: [Shipping]
+      summary: List covered destinations
+      description: |
+        The canonical state and city list (with Arabic names) that orders and rates
+        accept. A city outside this list is refused with `422 address_invalid`.
+        Required scope `shipping:read`.
+      x-required-scope: shipping:read
+      security:
+        - merchantApiKey: ["shipping:read"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+        - name: country
+          in: query
+          required: false
+          description: ISO 3166-1 alpha-2. Defaults to the store country.
+          schema: { $ref: '#/components/schemas/CountryCode' }
+      responses:
+        '200':
+          description: Covered destinations.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Coverage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /orders:
+    post:
+      operationId: createOrder
+      tags: [Orders]
+      summary: Push a paid order
+      description: |
+        Creates a PrintaRex order from a **paid** website order.
+
+        - **Idempotency uses the natural key** `external_order_id` (unique per store,
+          at most 50 characters). The same id with the same body returns the existing
+          order with `200`. The same id with a different body returns
+          `409 idempotency_key_reuse`. Re-posting the id of a cancelled order returns
+          `409 external_id_in_use` with the existing order id in `details`.
+        - `Idempotency-Key` is optional in v1; it is logged but responses are not
+          replayed from it.
+        - `payment_status` must be `paid`. Cash on delivery: push the
+          order only once your website treats it as committed and paid.
+        - A **missing** phone is accepted and the order is held as
+          `on_hold(missing_phone)`; add it with `PATCH /orders/{id}/shipping-address`.
+          An invalid phone is refused.
+        - The first orders of a new key (live or UAT) are held for merchant approval
+          (`on_hold(velocity_review)`), and daily caps apply (`429 velocity_cap`).
+        - Line items are capped (default 100) and so is quantity per line.
+
+        Required scope `orders:write`.
+      x-required-scope: orders:write
+      security:
+        - merchantApiKey: ["orders:write"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderCreate' }
+      responses:
+        '200':
+          description: Idempotent repeat of an earlier identical request; the existing order.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '201':
+          description: Order received.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+            Location:
+              description: URL of the new order.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '402': { $ref: '#/components/responses/PlanRequired' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            One of `idempotency_key_reuse` (same `external_order_id`, different body) or
+            `external_id_in_use` (the id belongs to a cancelled order; `details.existing_order_id`
+            is set).
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '410':
+          description: '`variant_retired`: a line references a variant that is no longer published.'
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            One of `variant_unknown` (also a variant whose listing the website reported as failed), `variant_out_of_stock`, `multi_provider_cart`,
+            `currency_mismatch`, `destination_uncovered`, `billing_not_available`,
+            `payment_status_unsupported`, `phone_invalid`, `address_invalid`,
+            `too_many_items` (more line items than the cap, default 100),
+            `validation_failed`. `field` names the offending JSON path.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                unpaid:
+                  value:
+                    code: payment_status_unsupported
+                    message: Only paid orders are accepted.
+                    field: payment_status
+                    request_id: req_01J9Z8Q4H3
+        '413':
+          description: '`payload_too_large`: the request body is over the size cap enforced by the API.'
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429':
+          description: |
+            `rate_limited` (per-key request limit) or `velocity_cap` (orders per day,
+            daily value in the store currency against that currency's cap, or quantity
+            per line over the new-key caps). Wait for `Retry-After` seconds. An order in a
+            currency with no configured value cap is not refused: it is accepted and held
+            as `on_hold(velocity_review)`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            Retry-After: { $ref: '#/components/headers/Retry-After' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `entitlement_unavailable` (the plan check could not run; retry, never cached)
+            or `order_intake_paused` (order intake is switched off). Both carry `Retry-After`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            Retry-After: { $ref: '#/components/headers/Retry-After' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500': { $ref: '#/components/responses/InternalError' }
+    get:
+      operationId: listOrders
+      tags: [Orders]
+      summary: Find orders by website id or by change time
+      description: |
+        Exactly one of `external_id` or `updated_since` is required
+        (`422 validation_failed` otherwise).
+        - `external_id` returns zero or one order.
+        - `updated_since` returns orders whose public output changed at or after that
+          time, oldest change first, cursor paginated (use it to reconcile missed webhooks).
+        Required scope `orders:read`.
+      x-required-scope: orders:read
+      security:
+        - merchantApiKey: ["orders:read"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+        - name: external_id
+          in: query
+          required: false
+          schema: { type: string, maxLength: 50 }
+        - name: updated_since
+          in: query
+          required: false
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of orders.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /orders/{order_id}:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    get:
+      operationId: getOrder
+      tags: [Orders]
+      summary: Get one order
+      description: |
+        Reads the same local projection that drives the order webhooks, so the
+        result and the latest webhook agree. Another store's id returns `404`.
+        Required scope `orders:read`.
+      x-required-scope: orders:read
+      security:
+        - merchantApiKey: ["orders:read"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      responses:
+        '200':
+          description: The order.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /orders/{order_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    post:
+      operationId: cancelOrder
+      tags: [Orders]
+      summary: Request cancellation
+      description: |
+        Cancellation is **asynchronous**. A `202` means the request was accepted,
+        not that the order is cancelled. The final answer arrives as `order.cancelled`
+        (with `refund`) or `order.cancel_rejected`. Pre-checks return `409 payment_in_progress`
+        (the merchant charge is running) or `409 cancel_window_closed` (production started).
+        Cancelling an order that is already cancelled or rejected returns `202` again. After
+        an `order.cancel_rejected` the order continues, and you may request cancellation
+        again: each new request gets its own answer.
+        Required scope `orders:write`.
+      x-required-scope: orders:write
+      security:
+        - merchantApiKey: ["orders:write"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CancelRequest' }
+      responses:
+        '202':
+          description: Cancellation requested.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CancelResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: One of `payment_in_progress`, `cancel_window_closed`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /orders/{order_id}/shipping-address:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    patch:
+      operationId: updateOrderShippingAddress
+      tags: [Orders]
+      summary: Correct the shipping address
+      description: |
+        v1 changes only `name`, `phone`, `address1`, `address2` and `postal_code`.
+        Sending a `city`, `state` or `country` that differs from the stored value returns
+        `409 address_change_requires_reprice`. Once the courier is booked the address is
+        locked (`409 address_locked`). Adding a phone releases `on_hold(missing_phone)`;
+        the new status arrives by webhook. Required scope `orders:write`.
+      x-required-scope: orders:write
+      security:
+        - merchantApiKey: ["orders:write"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      requestBody:
+        required: true
+        content:
+          application/merge-patch+json:
+            schema: { $ref: '#/components/schemas/ShippingAddressPatch' }
+          application/json:
+            schema: { $ref: '#/components/schemas/ShippingAddressPatch' }
+      responses:
+        '200':
+          description: |
+            Address updated. The body is the order projection; a hold release can lag
+            and is reported by `order.status_changed` (synchronous 200).
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: One of `address_locked`, `address_change_requires_reprice`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: One of `phone_invalid`, `address_invalid`, `validation_failed`.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /webhook-deliveries:
+    get:
+      operationId: listWebhookDeliveries
+      tags: [Webhooks]
+      summary: List webhook deliveries
+      description: |
+        Delivery log, newest first. Response bodies from your endpoint are never stored.
+        Successful deliveries are kept 30 days, dead ones 90 days.
+        Required scope `webhooks:manage`.
+      x-required-scope: webhooks:manage
+      security:
+        - merchantApiKey: ["webhooks:manage"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: status
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/WebhookDeliveryStatus' }
+        - name: event_type
+          in: query
+          required: false
+          schema: { $ref: '#/components/schemas/WebhookEventType' }
+      responses:
+        '200':
+          description: A page of deliveries.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookDeliveryPage' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /webhook-deliveries/{delivery_id}/replay:
+    parameters:
+      - name: delivery_id
+        in: path
+        required: true
+        description: Opaque delivery id.
+        schema: { type: string }
+    post:
+      operationId: replayWebhookDelivery
+      tags: [Webhooks]
+      summary: Replay a delivery
+      description: |
+        Queues the same event (same `PrintaRex-Event-Id`, current `sequence`) for a new
+        delivery, signed with the current secret. Required scope `webhooks:manage`.
+      x-required-scope: webhooks:manage
+      security:
+        - merchantApiKey: ["webhooks:manage"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      responses:
+        '202':
+          description: Replay queued.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookDelivery' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+  /webhooks/test:
+    post:
+      operationId: sendTestWebhook
+      tags: [Webhooks]
+      summary: Send a signed sample event
+      description: |
+        Emits a correctly signed sample of any event type to the store's webhook
+        endpoint. Samples use placeholder ids that match no real product or order. Required scope `webhooks:manage`.
+      x-required-scope: webhooks:manage
+      security:
+        - merchantApiKey: ["webhooks:manage"]
+      parameters:
+        - $ref: '#/components/parameters/ApiVersionRequest'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [event_type]
+              properties:
+                event_type: { $ref: '#/components/schemas/WebhookEventType' }
+      responses:
+        '202':
+          description: Test delivery queued.
+          headers:
+            X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+            PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+            RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+            RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+            RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+            Deprecation: { $ref: '#/components/headers/Deprecation' }
+            Sunset: { $ref: '#/components/headers/Sunset' }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookDelivery' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+        '503': { $ref: '#/components/responses/EntitlementUnavailable' }
+
+webhooks:
+  product.publish_requested:
+    post:
+      operationId: onProductPublishRequested
+      tags: [Products]
+      summary: product.publish_requested
+      description: |
+        The merchant published a product to your website. `data.product` carries the
+        primary image only; the gallery follows in `product.updated{changed:[images]}`.
+        Create the listing, then call `POST /products/{id}/confirmation` or
+        `/publish-failure`. Also re-sent on reconnect for retained products.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  product.updated:
+    post:
+      operationId: onProductUpdated
+      tags: [Products]
+      summary: product.updated
+      description: |
+        The product's public output changed. `data.changed` lists what changed
+        (for example `images`, `variants`, `price`, `details`). Coalesced: several
+        changes can arrive as one event.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  product.unpublish_requested:
+    post:
+      operationId: onProductUnpublishRequested
+      tags: [Products]
+      summary: product.unpublish_requested
+      description: |
+        The merchant unpublished the product or disconnected the store. Take the listing
+        down and call `POST /products/{id}/removed`.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  product.deleted:
+    post:
+      operationId: onProductDeleted
+      tags: [Products]
+      summary: product.deleted
+      description: The product no longer exists in PrintaRex. Remove the listing; no confirmation call is needed.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductDeletedEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  product.cost_changed:
+    post:
+      operationId: onProductCostChanged
+      tags: [Products]
+      summary: product.cost_changed
+      description: |
+        The provider's price changed, so the merchant's cost (`data.product.cost`) changed.
+        PrintaRex never changes your retail price; review your margin.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProductEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  inventory.updated:
+    post:
+      operationId: onInventoryUpdated
+      tags: [Products]
+      summary: inventory.updated
+      description: |
+        Availability of one product's variants changed (coalesced). `data.variants` lists
+        **every** variant of the product with its current availability, not only the ones
+        that changed, so you can replace your stored stock for the product. `sequence` is
+        the product's sequence: ignore an event older than one you already applied.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/InventoryUpdatedEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.status_changed:
+    post:
+      operationId: onOrderStatusChanged
+      tags: [Orders]
+      summary: order.status_changed
+      description: The public status or hold reason changed. `data.order` is the full current order.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderStatusChangedEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.payment_failed:
+    post:
+      operationId: onOrderPaymentFailed
+      tags: [Orders]
+      summary: order.payment_failed
+      description: The merchant's charge for this order failed. `data.retry_url` is the portal page where the merchant resolves it.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderPaymentProblemEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.payment_expired:
+    post:
+      operationId: onOrderPaymentExpired
+      tags: [Orders]
+      summary: order.payment_expired
+      description: The payment window for this order expired. `data.retry_url` is the portal page where the merchant resolves it.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderPaymentProblemEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.charged:
+    post:
+      operationId: onOrderCharged
+      tags: [Orders]
+      summary: order.charged
+      description: The merchant was charged for this order. `data.charge.amount` is the amount as charged, in whole AED (AFS rounding rule).
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderChargedEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.shipped:
+    post:
+      operationId: onOrderShipped
+      tags: [Orders]
+      summary: order.shipped
+      description: Sent once per shipment. An own-driver shipment has no carrier and no tracking.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderShipmentEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.delivered:
+    post:
+      operationId: onOrderDelivered
+      tags: [Orders]
+      summary: order.delivered
+      description: A shipment was delivered.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderShipmentEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  shipment.exception:
+    post:
+      operationId: onShipmentException
+      tags: [Orders]
+      summary: shipment.exception
+      description: The carrier reported a problem with a shipment (returned to sender, exception, or on hold).
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ShipmentExceptionEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.cancelled:
+    post:
+      operationId: onOrderCancelled
+      tags: [Orders]
+      summary: order.cancelled
+      description: |
+        The order is cancelled. `data.refund.amount` is `null` when no money moved
+        (orders are charged only at production, so most cancellations move none).
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderRefundEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.cancel_rejected:
+    post:
+      operationId: onOrderCancelRejected
+      tags: [Orders]
+      summary: order.cancel_rejected
+      description: A cancellation request was refused; the order continues.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderCancelRejectedEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  order.refunded:
+    post:
+      operationId: onOrderRefunded
+      tags: [Orders]
+      summary: order.refunded
+      description: Money was refunded to the merchant for this order.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OrderRefundEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  return.status_changed:
+    post:
+      operationId: onReturnStatusChanged
+      tags: [Orders]
+      summary: return.status_changed
+      description: |
+        A return on a delivered order changed state. v1 defines one member of the `return.*` family. New `return.*` types may be added;
+        acknowledge unknown types with 2xx.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReturnStatusChangedEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  connection.disabled:
+    post:
+      operationId: onConnectionDisabled
+      tags: [Store]
+      summary: connection.disabled
+      description: |
+        The store connection was disabled: `plan_lapsed`, `disconnected` (by the merchant),
+        `revoked` or `admin` (suspended by PrintaRex). Existing orders keep reporting status.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConnectionDisabledEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  api_key.expiring:
+    post:
+      operationId: onApiKeyExpiring
+      tags: [Store]
+      summary: api_key.expiring
+      description: An API key expires soon (sent 30 and 7 days before). Rotate it in the portal; both keys work during the overlap.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApiKeyExpiringEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+  ping:
+    post:
+      operationId: onPing
+      tags: [Webhooks]
+      summary: ping
+      description: |
+        A signed ping. A successful answer is one of the go-live checks and part of
+        the connection health check.
+      parameters:
+        - $ref: '#/components/parameters/SignatureHeader'
+        - $ref: '#/components/parameters/EventIdHeader'
+        - $ref: '#/components/parameters/EventTypeHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PingEvent' }
+      responses:
+        '2XX': { $ref: '#/components/responses/WebhookAck' }
+        default: { $ref: '#/components/responses/WebhookFailure' }
+
+components:
+  securitySchemes:
+    merchantApiKey:
+      type: http
+      scheme: bearer
+      bearerFormat: prx_live_<43 base64url chars> | prx_uat_<43 base64url chars>
+      description: |
+        `Authorization: Bearer <key>` only; a key in a query string is refused.
+        - Prefix `prx_live_` (production) or `prx_uat_` (UAT); the prefix must match the
+          environment. A key is 32 random bytes, Base64URL encoded.
+        - Scopes: `store:read`, `products:read`, `products:write`, `orders:read`,
+          `orders:write`, `shipping:read`, `webhooks:manage`. Each operation lists
+          its scope in `security` and `x-required-scope`. The store's first key has all
+          scopes; extra keys default to read-only (`store:read`, `products:read`,
+          `orders:read`, `shipping:read`).
+        - Keys expire (default 12 months): `401 key_expired`. Revocation applies on the
+          next request.
+        - Optional per-key IP allowlist (up to 10 CIDRs): a call from another address gets
+          `403 ip_not_allowed`.
+
+  parameters:
+    ApiVersionRequest:
+      name: PrintaRex-Api-Version
+      in: header
+      required: false
+      description: |
+        Optional. The API version the client was built against. Format `YYYY-MM-DD`
+        (date-versioned releases inside the `/v1` path; the initial value is
+        fixed at launch). Omitted means the current v1 version. An unsupported value
+        returns `422 validation_failed` with `field: PrintaRex-Api-Version`.
+      schema:
+        type: string
+        pattern: '^\d{4}-\d{2}-\d{2}$'
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Optional in v1 and only logged. The real idempotency key is
+        `external_order_id`.
+      schema: { type: string, minLength: 1, maxLength: 255 }
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor from `next_cursor` of the previous page.
+      schema: { type: string }
+    ProductId:
+      name: product_id
+      in: path
+      required: true
+      description: PrintaRex product id (`prd_...`).
+      schema: { type: string, pattern: '^prd_[A-Za-z0-9]+$' }
+    OrderId:
+      name: order_id
+      in: path
+      required: true
+      description: PrintaRex order id (opaque).
+      schema: { type: string }
+    SignatureHeader:
+      name: PrintaRex-Signature
+      in: header
+      required: true
+      description: |
+        `t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<raw body>" with the endpoint secret>`.
+        Reject if `t` is more than 5 minutes from your clock. During a secret rotation the
+        header carries two `v1=` entries (current and previous secret); accept if either
+        matches. Compare in constant time and verify against the raw body bytes.
+      schema: { type: string }
+      example: t=1760862600,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd
+    EventIdHeader:
+      name: PrintaRex-Event-Id
+      in: header
+      required: true
+      description: Same as the payload `id`. Stable across retries and replays; use it to de-duplicate.
+      schema: { type: string }
+    EventTypeHeader:
+      name: PrintaRex-Event-Type
+      in: header
+      required: true
+      description: Same as the payload `type`.
+      schema: { $ref: '#/components/schemas/WebhookEventType' }
+
+  headers:
+    X-Request-Id:
+      description: Unique id of this request; also in the error body as `request_id`, and linked to logs and deliveries.
+      schema: { type: string }
+    PrintaRex-Api-Version:
+      description: The API version that served the request.
+      schema: { type: string }
+    RateLimit-Limit:
+      description: Requests allowed in the current window for this key and route class.
+      schema: { type: integer }
+    RateLimit-Remaining:
+      description: Requests left in the current window.
+      schema: { type: integer }
+    RateLimit-Reset:
+      description: Seconds until the window resets.
+      schema: { type: integer }
+    Retry-After:
+      description: Seconds to wait before retrying.
+      schema: { type: integer, minimum: 1 }
+    Deprecation:
+      description: Present when the version or operation is deprecated (RFC 9745), e.g. `@1767225600`.
+      schema: { type: string }
+    Sunset:
+      description: Present when a removal date is set (RFC 8594), an HTTP date.
+      schema: { type: string }
+
+  responses:
+    Unauthorized:
+      description: '`unauthorized` (missing, malformed, unknown or revoked key) or `key_expired`.'
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+        PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+        WWW-Authenticate:
+          description: '`Bearer`'
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          examples:
+            expired:
+              value:
+                code: key_expired
+                message: This API key expired. Create a new key in the Developers tab.
+                field: null
+                request_id: req_01J9Z8Q4H3
+    Forbidden:
+      description: '`forbidden_scope` (the key lacks the required scope) or `ip_not_allowed` (the caller is outside the key''s IP allowlist).'
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+        PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: '`not_found`. Also returned for another store''s id, so ids never leak across tenants.'
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+        PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    ValidationFailed:
+      description: '`validation_failed`: the request is malformed or a parameter is invalid; `field` names it.'
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+        PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    PlanRequired:
+      description: |
+        `plan_required`: the store's Premium plan lapsed and the grace period ended.
+        Existing orders, reads, status and cancel keep working.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+        PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    RateLimited:
+      description: '`rate_limited`: over the per-key request limit. Wait `Retry-After` seconds.'
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+        PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+        RateLimit-Limit: { $ref: '#/components/headers/RateLimit-Limit' }
+        RateLimit-Remaining: { $ref: '#/components/headers/RateLimit-Remaining' }
+        RateLimit-Reset: { $ref: '#/components/headers/RateLimit-Reset' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    InternalError:
+      description: '`internal_error`: an unexpected failure. Never cached; quote `request_id` to support.'
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+        PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    EntitlementUnavailable:
+      description: |
+        `entitlement_unavailable`: the plan check could not run. Retry after `Retry-After`.
+        Never cached and never a 422.
+      headers:
+        X-Request-Id: { $ref: '#/components/headers/X-Request-Id' }
+        PrintaRex-Api-Version: { $ref: '#/components/headers/PrintaRex-Api-Version' }
+        Retry-After: { $ref: '#/components/headers/Retry-After' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    WebhookAck:
+      description: Any 2xx within 10 seconds acknowledges the event. The response body is ignored and never stored.
+    WebhookFailure:
+      description: |
+        Any other status, a redirect (redirects are not followed), a timeout over 10 s, or a
+        response over 64 KB is a failure. Retries follow 1 m, 5 m, 30 m, 2 h, 6 h, 12 h and
+        24 h (about 44.6 h in total, 8 attempts). After the last failure the endpoint is
+        disabled and the merchant is emailed; re-enabling it in the portal replays the backlog.
+
+  schemas:
+    Error:
+      type: object
+      description: Canonical error envelope.
+      required: [code, message, field, request_id]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable lower_snake error code. Open enum: tolerate unknown codes and fall back
+            on the HTTP status.
+            | Code | HTTP |
+            |---|---|
+            | variant_unknown, multi_provider_cart, currency_mismatch, destination_uncovered, billing_not_available, payment_status_unsupported, variant_out_of_stock, phone_invalid, address_invalid, too_many_items, validation_failed | 422 |
+            | variant_retired | 410 |
+            | external_id_in_use, idempotency_key_reuse, address_locked, address_change_requires_reprice, cancel_window_closed, payment_in_progress | 409 |
+            | plan_required | 402 |
+            | rate_limited, velocity_cap | 429 + Retry-After |
+            | unauthorized, key_expired | 401 |
+            | forbidden_scope, ip_not_allowed | 403 |
+            | not_found | 404 |
+            | entitlement_unavailable | 503 + Retry-After |
+            | order_intake_paused | 503 + Retry-After |
+            | internal_error | 500 |
+            | payload_too_large | 413 |
+          x-extensible-enum:
+            - variant_unknown
+            - multi_provider_cart
+            - currency_mismatch
+            - destination_uncovered
+            - billing_not_available
+            - payment_status_unsupported
+            - variant_out_of_stock
+            - phone_invalid
+            - address_invalid
+            - too_many_items
+            - validation_failed
+            - variant_retired
+            - external_id_in_use
+            - idempotency_key_reuse
+            - address_locked
+            - address_change_requires_reprice
+            - cancel_window_closed
+            - payment_in_progress
+            - plan_required
+            - rate_limited
+            - velocity_cap
+            - unauthorized
+            - key_expired
+            - forbidden_scope
+            - ip_not_allowed
+            - not_found
+            - entitlement_unavailable
+            - order_intake_paused
+            - internal_error
+            - payload_too_large
+        message:
+          type: string
+          description: Human-readable; may change. Never parse it.
+        field:
+          type: [string, 'null']
+          description: JSON path or parameter/header name the error is about, or null.
+        request_id:
+          type: string
+          description: Same as the `X-Request-Id` response header.
+        details:
+          type: object
+          description: |
+            Optional, code-specific extras (the envelope stays `{code, message,
+            field, request_id}`; extras live here). `external_id_in_use` sets
+            `existing_order_id`.
+          properties:
+            existing_order_id: { type: string }
+      example:
+        code: variant_unknown
+        message: Variant var_8kQ2 does not exist in this store.
+        field: items[0].variant_id
+        request_id: req_01J9Z8Q4H3
+
+    DecimalAmount:
+      type: string
+      description: Non-negative decimal amount as a string, always with its currency alongside.
+      pattern: '^\d{1,12}(\.\d{1,2})?$'
+      example: '49.00'
+    NullableDecimalAmount:
+      type: [string, 'null']
+      description: Decimal amount as a string, or `null` when unknown. Never `"0.00"` as a placeholder.
+      pattern: '^\d{1,12}(\.\d{1,2})?$'
+    CurrencyCode:
+      type: string
+      description: ISO 4217. Live stores use AED.
+      pattern: '^[A-Z]{3}$'
+      example: AED
+    CountryCode:
+      type: string
+      description: ISO 3166-1 alpha-2. Live stores are AE only.
+      pattern: '^[A-Z]{2}$'
+      example: AE
+    PhoneE164:
+      type: string
+      description: E.164 phone number.
+      pattern: '^\+[1-9]\d{6,14}$'
+      example: '+971501234567'
+
+    Store:
+      type: object
+      required: [id, name, website_url, country, currency, environment, fulfillment_mode, delay_hours, auto_routing, payment_method_ready, listing_limits]
+      properties:
+        id: { type: string, description: "Store connection id (opaque)." }
+        name: { type: string }
+        website_url: { type: string, format: uri }
+        country:
+          $ref: '#/components/schemas/CountryCode'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        environment:
+          type: string
+          enum: [uat, live]
+          description: Environment of the key used for this call.
+        fulfillment_mode:
+          type: string
+          description: |
+            Merchant setting in the portal. `instant` sends orders on receipt;
+            `manual_approval` waits for the merchant; `delayed_auto_submit` waits
+            `delay_hours`. A new key's first orders (live or UAT) are held for review regardless
+            (`on_hold(velocity_review)`).
+          x-extensible-enum: [instant, manual_approval, delayed_auto_submit]
+        delay_hours:
+          type: [integer, 'null']
+          description: Hours before auto-submit when `fulfillment_mode` is `delayed_auto_submit`; otherwise null.
+        auto_routing:
+          type: boolean
+          description: Whether PrintaRex reassigns another provider automatically when one declines.
+        payment_method_ready:
+          type: boolean
+          description: |
+            True when the merchant has a card eligible for merchant-initiated charges
+            (active, unexpired, authorized for store-order auto-charge). When false, new
+            orders go to `on_hold(payment_method_missing)`.
+        listing_limits:
+          type: object
+          description: Plan allowance for new product publications to this store, per calendar month.
+          required: [monthly_new_products_limit, monthly_new_products_used, resets_on]
+          properties:
+            monthly_new_products_limit:
+              type: [integer, 'null']
+              description: Null means unlimited.
+            monthly_new_products_used: { type: integer, minimum: 0 }
+            resets_on: { type: string, format: date }
+
+    ListingState:
+      type: string
+      description: |
+        Website listing state. `sent`: delivered to the website, not yet confirmed.
+        `confirmed`: the website called `/confirmation`. `failed`: the website called
+        `/publish-failure`. `unconfirmed`: no answer within the confirmation window (72 h default).
+      x-extensible-enum: [sent, confirmed, failed, unconfirmed]
+
+    ProductImage:
+      type: object
+      required: [src, position, variant_ids, is_default]
+      properties:
+        src:
+          type: string
+          format: uri
+          description: Signed link; download and host the image. It expires.
+        src_expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: When `src` stops working .
+        position: { type: integer, minimum: 1, description: "1 is the primary image." }
+        variant_ids:
+          type: array
+          items: { type: string }
+          description: Variants this image shows; empty means all.
+        is_default: { type: boolean }
+        alt: { type: [string, 'null'] }
+
+    ProductVariant:
+      type: object
+      required: [id, sku, color, size, price, currency, available, provider_group_id, weight_grams]
+      properties:
+        id: { type: string, pattern: '^var_[A-Za-z0-9]+$', description: "PrintaRex variant id. Use it in orders and rates." }
+        sku: { type: string }
+        color:
+          type: [object, 'null']
+          required: [name, hex]
+          properties:
+            name: { type: string }
+            hex:
+              type: [string, 'null']
+              pattern: '^#[0-9A-Fa-f]{6}$'
+              description: Colour swatch. Null when PrintaRex has no verified hex for the colour (v1 sends null).
+        size: { type: [string, 'null'] }
+        price:
+          $ref: '#/components/schemas/DecimalAmount'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        available: { type: boolean }
+        provider_group_id:
+          type: string
+          description: Variants with different values cannot share one order.
+        weight_grams:
+          type: [integer, 'null']
+          description: Shipping weight in grams. Null when unknown (v1 sends null).
+
+    ProductionTime:
+      type: object
+      required: [base_days, bulk_tiers]
+      properties:
+        base_days: { type: integer, minimum: 0 }
+        bulk_tiers:
+          type: array
+          description: Longer production for large quantities. Field names mirror product-service `BulkPricingTier`.
+          items:
+            type: object
+            required: [min_quantity, production_days]
+            properties:
+              min_quantity: { type: integer, minimum: 1 }
+              production_days: { type: integer, minimum: 0 }
+
+    ProductCost:
+      type: object
+      description: The merchant's PrintaRex cost per unit. Any part may be null when unknown.
+      required: [production, shipping_from, branding, order_fee, currency]
+      properties:
+        production:
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        shipping_from:
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        branding:
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        order_fee:
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+
+    Product:
+      type: object
+      required: [id, status, title, description_html, tags, type, images, variants, production_time, cost, listing_state, listing_reason, website_product_id, website_url, updated_at, sequence]
+      properties:
+        id: { type: string, pattern: '^prd_[A-Za-z0-9]+$' }
+        status:
+          type: string
+          description: |
+            `published` accepts orders; anything else does not (orders get
+            `410 variant_retired`). field name and values.
+          x-extensible-enum: [published, unpublished]
+        title: { type: string }
+        description_html: { type: string }
+        tags:
+          type: array
+          items: { type: string }
+        type: { type: string, description: "Product type label." }
+        images:
+          type: array
+          items: { $ref: '#/components/schemas/ProductImage' }
+        variants:
+          type: array
+          items: { $ref: '#/components/schemas/ProductVariant' }
+        production_time:
+          $ref: '#/components/schemas/ProductionTime'
+        cost:
+          $ref: '#/components/schemas/ProductCost'
+        listing_state:
+          $ref: '#/components/schemas/ListingState'
+        listing_reason:
+          type: [string, 'null']
+          description: Reason reported by the website when `listing_state` is `failed`.
+        website_product_id: { type: [string, 'null'] }
+        website_url: { type: [string, 'null'], format: uri }
+        updated_at: { type: string, format: date-time }
+        sequence:
+          type: integer
+          format: int64
+          description: Increases only when the public output changes. Drop events with a lower or equal value.
+
+    ProductPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Product' }
+        next_cursor: { type: [string, 'null'] }
+
+    ProductConfirmation:
+      type: object
+      additionalProperties: false
+      required: [website_product_id, website_url]
+      properties:
+        website_product_id: { type: string, minLength: 1, maxLength: 255 }
+        website_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          description: Public product page; must be https.
+
+    PublishFailure:
+      type: object
+      additionalProperties: false
+      required: [message]
+      properties:
+        code:
+          type: string
+          maxLength: 64
+          description: Website-defined reason code.
+        message:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Shown to the merchant in the portal.
+
+    ProductRemoved:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string, maxLength: 500 }
+
+    Inventory:
+      type: object
+      required: [variant_id, product_id, available, updated_at]
+      properties:
+        variant_id: { type: string }
+        product_id: { type: string }
+        available: { type: boolean }
+        quantity:
+          type: [integer, 'null']
+          description: Units available when known; null when the provider does not report a count.
+        updated_at: { type: string, format: date-time }
+
+    Destination:
+      type: object
+      required: [country, state, city]
+      properties:
+        country:
+          $ref: '#/components/schemas/CountryCode'
+        state: { type: string, description: "State or emirate, from `/shipping/coverage`." }
+        city: { type: string, description: "City from `/shipping/coverage`." }
+        postal_code: { type: [string, 'null'] }
+
+    ShippingRatesRequest:
+      type: object
+      additionalProperties: false
+      required: [destination, items]
+      properties:
+        destination:
+          $ref: '#/components/schemas/Destination'
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required: [variant_id, quantity]
+            properties:
+              variant_id: { type: string }
+              quantity: { type: integer, minimum: 1 }
+
+    ShippingRatesResponse:
+      type: object
+      description: An estimate of PrintaRex shipping cost, not the final charge. No `rate_id` and no expiry.
+      required: [currency, methods, production_time]
+      properties:
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        methods:
+          type: array
+          items:
+            type: object
+            required: [code, name, amount, currency, delivery_days]
+            properties:
+              code: { type: string, description: "Stable method code." }
+              name: { type: string }
+              amount:
+                $ref: '#/components/schemas/DecimalAmount'
+              currency:
+                $ref: '#/components/schemas/CurrencyCode'
+              delivery_days:
+                type: object
+                required: [min, max]
+                properties:
+                  min: { type: integer, minimum: 0 }
+                  max: { type: integer, minimum: 0 }
+        production_time:
+          type: object
+          description: Production days for this cart, including bulk tiers.
+          required: [days]
+          properties:
+            days: { type: integer, minimum: 0 }
+
+    Coverage:
+      type: object
+      required: [countries]
+      properties:
+        countries:
+          type: array
+          items:
+            type: object
+            required: [country, states]
+            properties:
+              country:
+                $ref: '#/components/schemas/CountryCode'
+              states:
+                type: array
+                items:
+                  type: object
+                  required: [name, name_ar, cities]
+                  properties:
+                    name: { type: string }
+                    name_ar: { type: [string, 'null'] }
+                    cities:
+                      type: array
+                      items:
+                        type: object
+                        required: [name, name_ar]
+                        properties:
+                          name: { type: string }
+                          name_ar: { type: [string, 'null'] }
+
+    ShippingAddress:
+      type: object
+      additionalProperties: false
+      required: [name, address1, city, state, country]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        phone:
+          description: Optional. Missing means the order is held as `on_hold(missing_phone)`; an invalid value is `422 phone_invalid`.
+          $ref: '#/components/schemas/PhoneE164'
+        email:
+          type: string
+          format: email
+          description: Recipient email. Falls back to `customer.email` when absent.
+        address1: { type: string, minLength: 1, maxLength: 255 }
+        address2: { type: [string, 'null'], maxLength: 255 }
+        city: { type: string, minLength: 1, description: "Must be in `/shipping/coverage`." }
+        state: { type: string, minLength: 1, description: "State or emirate; must be in `/shipping/coverage`." }
+        postal_code: { type: [string, 'null'], maxLength: 20 }
+        country:
+          $ref: '#/components/schemas/CountryCode'
+
+    OrderCreate:
+      type: object
+      additionalProperties: false
+      required: [external_order_id, payment_status, currency, customer, shipping_address, items]
+      properties:
+        external_order_id:
+          type: string
+          minLength: 1
+          maxLength: 50
+          description: Your order id. Unique per store and the idempotency key.
+        display_number:
+          type: [string, 'null']
+          maxLength: 50
+          description: The number your buyer sees (e.g. `#1042`). Display only.
+        payment_status:
+          type: string
+          enum: [paid]
+          description: Only `paid` is accepted. Anything else is `422 payment_status_unsupported`.
+        currency:
+          description: Must equal the store currency (`422 currency_mismatch`).
+          $ref: '#/components/schemas/CurrencyCode'
+        customer:
+          type: object
+          additionalProperties: false
+          required: [email]
+          properties:
+            email: { type: string, format: email }
+        shipping_address:
+          $ref: '#/components/schemas/ShippingAddress'
+        items:
+          type: array
+          minItems: 1
+          maxItems: 100
+          description: All variants must be published, in stock and from one provider group.
+          items:
+            type: object
+            additionalProperties: false
+            required: [variant_id, quantity, unit_price]
+            properties:
+              variant_id: { type: string }
+              quantity: { type: integer, minimum: 1, description: "Capped per line for new keys, live or UAT (`429 velocity_cap`)." }
+              unit_price:
+                description: Your retail price per unit, in `currency`.
+                $ref: '#/components/schemas/DecimalAmount'
+              external_line_id: { type: [string, 'null'], maxLength: 100 }
+
+    OrderStatus:
+      type: string
+      description: |
+        Public order status. **Open enum: tolerate unknown values.** Not monotonic.
+        - `received`: stored, not yet processed.
+        - `on_hold`: waiting; see `hold_reason`.
+        - `awaiting_provider`: waiting for the provider to accept.
+        - `awaiting_payment`: the provider accepted; the merchant charge is running.
+        - `in_production`, `shipped`, `delivered` (a return can follow, see `return`).
+        - `returned`, `refunded`, `cancelled`, `rejected` (the merchant declined it in the portal).
+      x-extensible-enum: [received, on_hold, awaiting_provider, awaiting_payment, in_production, shipped, delivered, returned, refunded, cancelled, rejected]
+
+    HoldReasonCode:
+      type: string
+      description: |
+        Why an order is `on_hold`. **Open enum.** Who acts:
+        - merchant in the portal: `awaiting_approval`, `delayed_submit`, `personalization_review`, `velocity_review`, `provider_selection_required`, `payment_method_missing`, `payment_failed`, `payment_expired`;
+        - website (`PATCH /orders/{id}/shipping-address`) or merchant: `missing_phone`;
+        - PrintaRex: `payment_review`, `payment_processing_unavailable`, `processing`.
+        `reassigning` is **not** a hold reason. A paid order can regress to `awaiting_provider`
+        when it is reassigned; the matching `status_history` entry then carries `note: reassigning`.
+      x-extensible-enum: [awaiting_approval, delayed_submit, personalization_review, velocity_review, missing_phone, payment_method_missing, payment_failed, payment_expired, payment_review, payment_processing_unavailable, provider_selection_required, processing]
+
+    HoldReason:
+      type: [object, 'null']
+      required: [code, action_required, action_url]
+      properties:
+        code:
+          $ref: '#/components/schemas/HoldReasonCode'
+        detail_code:
+          type: [string, 'null']
+          description: |
+            Payment-hold sub-code: `no_card`, `card_expired`,
+            `reauth_required`, `declined`, `retries_exhausted`. Open enum.
+          x-extensible-enum: [no_card, card_expired, reauth_required, declined, retries_exhausted]
+        action_required:
+          type: boolean
+          description: 'True when the merchant or website must act (boolean, not an actor name).'
+        action_url:
+          type: [string, 'null']
+          format: uri
+          description: Portal page where the merchant resolves the hold.
+
+    ReturnInfo:
+      type: [object, 'null']
+      description: Present when a return exists on a delivered order.
+      required: [status, action_required]
+      properties:
+        status:
+          type: string
+          description: Public return state .
+          x-extensible-enum: [requested, under_review, in_transit, received, rejected, cancelled]
+        action_required: { type: boolean }
+
+    Shipment:
+      type: object
+      required: [id, method, carrier, tracking_number, tracking_url, shipped_at, delivered_at]
+      properties:
+        id: { type: string }
+        method:
+          type: string
+          description: '`own_driver` shipments have no carrier and no tracking.'
+          x-extensible-enum: [carrier, own_driver]
+        carrier: { type: [string, 'null'] }
+        tracking_number: { type: [string, 'null'] }
+        tracking_url: { type: [string, 'null'], format: uri }
+        shipped_at: { type: [string, 'null'], format: date-time }
+        delivered_at: { type: [string, 'null'], format: date-time }
+
+    OrderCosts:
+      type: object
+      description: What PrintaRex charges the merchant. Unknown parts are null.
+      required: [production, shipping, branding, fee, currency, basis]
+      properties:
+        production:
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        shipping:
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        branding:
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        fee:
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        basis:
+          type: string
+          enum: [estimated, final]
+          description: '`final` once charged.'
+
+    StatusHistoryEntry:
+      type: object
+      required: [status, at]
+      properties:
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        hold_reason:
+          type: [string, 'null']
+          description: Hold reason code at that point, if any. Omitted or null otherwise.
+        note:
+          type: [string, 'null']
+          description: |
+            Optional free-form marker. `reassigning` marks a paid order that went back to
+            `awaiting_provider` (statuses are not monotonic). Open value set.
+        at: { type: string, format: date-time }
+
+    Order:
+      type: object
+      description: |
+        Order read model. Same projection as the order webhooks. Contains no buyer
+        personal data. There is no per-line status, no reshipment flag and no shipment-to-line
+        link in v1.
+      required: [id, external_order_id, display_number, payment_status, currency, status, hold_reason, return, items, shipments, costs, estimated_delivery, created_at, updated_at, status_history, sequence]
+      properties:
+        id: { type: string }
+        external_order_id: { type: string }
+        display_number: { type: [string, 'null'] }
+        payment_status: { type: string, enum: [paid] }
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+        hold_reason:
+          $ref: '#/components/schemas/HoldReason'
+        return:
+          $ref: '#/components/schemas/ReturnInfo'
+        items:
+          type: array
+          description: Your lines, echoed back.
+          items:
+            type: object
+            required: [variant_id, product_id, quantity, unit_price, external_line_id]
+            properties:
+              variant_id: { type: string }
+              product_id: { type: string }
+              quantity: { type: integer }
+              unit_price:
+                $ref: '#/components/schemas/DecimalAmount'
+              external_line_id: { type: [string, 'null'] }
+        shipments:
+          type: array
+          items: { $ref: '#/components/schemas/Shipment' }
+        costs:
+          $ref: '#/components/schemas/OrderCosts'
+        estimated_delivery:
+          type: [object, 'null']
+          description: Estimated delivery window.
+          required: [earliest, latest]
+          properties:
+            earliest: { type: string, format: date }
+            latest: { type: string, format: date }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        status_history:
+          type: array
+          items: { $ref: '#/components/schemas/StatusHistoryEntry' }
+        sequence:
+          type: integer
+          format: int64
+          description: Increases only when the public output changes.
+
+    OrderPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/Order' }
+        next_cursor: { type: [string, 'null'] }
+
+    CancelRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason: { type: string, maxLength: 500 }
+
+    CancelResponse:
+      type: object
+      required: [order_id, cancellation_status]
+      properties:
+        order_id: { type: string }
+        cancellation_status:
+          type: string
+          enum: [requested]
+
+    ShippingAddressPatch:
+      type: object
+      description: |
+        Only these fields can change in v1. Sending `city`, `state` or `country` with a
+        different value returns `409 address_change_requires_reprice`; any other unknown
+        field returns `422 validation_failed`.
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 200 }
+        phone:
+          $ref: '#/components/schemas/PhoneE164'
+        address1: { type: string, minLength: 1, maxLength: 255 }
+        address2: { type: [string, 'null'], maxLength: 255 }
+        postal_code: { type: [string, 'null'], maxLength: 20 }
+        city: { type: string, description: "Accepted only if unchanged." }
+        state: { type: string, description: "Accepted only if unchanged." }
+        country:
+          description: Accepted only if unchanged.
+          $ref: '#/components/schemas/CountryCode'
+
+    WebhookDeliveryStatus:
+      type: string
+      description: Delivery state. `dead` means retries are exhausted.
+      x-extensible-enum: [pending, succeeded, failed, dead]
+
+    WebhookDelivery:
+      type: object
+      required: [id, event_id, event_type, status, attempt, response_code, created_at, last_attempt_at, next_attempt_at]
+      properties:
+        id: { type: string }
+        event_id: { type: string }
+        event_type:
+          $ref: '#/components/schemas/WebhookEventType'
+        status:
+          $ref: '#/components/schemas/WebhookDeliveryStatus'
+        attempt: { type: integer, minimum: 0 }
+        response_code: { type: [integer, 'null'], description: "HTTP status your endpoint returned; null on timeout or connection error." }
+        created_at: { type: string, format: date-time }
+        last_attempt_at: { type: [string, 'null'], format: date-time }
+        next_attempt_at: { type: [string, 'null'], format: date-time }
+
+    WebhookDeliveryPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: { $ref: '#/components/schemas/WebhookDelivery' }
+        next_cursor: { type: [string, 'null'] }
+
+    WebhookEventType:
+      type: string
+      description: Open enum; acknowledge unknown types with 2xx.
+      x-extensible-enum:
+        - product.publish_requested
+        - product.updated
+        - product.unpublish_requested
+        - product.deleted
+        - product.cost_changed
+        - inventory.updated
+        - order.status_changed
+        - order.payment_failed
+        - order.payment_expired
+        - order.charged
+        - order.shipped
+        - order.delivered
+        - shipment.exception
+        - order.cancelled
+        - order.cancel_rejected
+        - order.refunded
+        - return.status_changed
+        - connection.disabled
+        - api_key.expiring
+        - ping
+
+    WebhookEnvelope:
+      type: object
+      description: |
+        Every webhook body. Delivery is at-least-once and unordered; de-duplicate on `id`
+        and drop events whose `sequence` is lower than the one you stored for that
+        resource (events caused by the same change share one sequence). Payloads are fat (full current state) and carry no buyer personal data.
+      required: [id, type, api_version, created_at, attempt, sequence, store_id, data]
+      properties:
+        id: { type: string, description: "Event id; equals `PrintaRex-Event-Id`." }
+        type:
+          $ref: '#/components/schemas/WebhookEventType'
+        api_version: { type: string }
+        created_at: { type: string, format: date-time }
+        attempt: { type: integer, minimum: 1, description: "1 on first delivery." }
+        sequence:
+          type: [integer, 'null']
+          format: int64
+          description: |
+            The resource's public sequence (order or product). Null for events that are not
+            about one order or product (`connection.disabled`, `api_key.expiring`, `ping`).
+        store_id: { type: string }
+        data: { type: object }
+
+    ProductEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [product]
+              properties:
+                product:
+                  $ref: '#/components/schemas/Product'
+                changed:
+                  type: array
+                  description: Only on `product.updated`. Open list, e.g. `images`, `variants`, `price`, `details`.
+                  items: { type: string }
+
+    ProductDeletedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [product_id, website_product_id]
+              properties:
+                product_id: { type: string }
+                website_product_id: { type: [string, 'null'] }
+
+    InventoryUpdatedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [product_id, variants]
+              properties:
+                product_id: { type: string }
+                variants:
+                  type: array
+                  items: { $ref: '#/components/schemas/Inventory' }
+
+    OrderStatusChangedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [order, previous_status]
+              properties:
+                order:
+                  $ref: '#/components/schemas/Order'
+                previous_status:
+                  oneOf:
+                    - $ref: '#/components/schemas/OrderStatus'
+                    - type: 'null'
+
+    OrderPaymentProblemEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [order, retry_url]
+              properties:
+                order:
+                  $ref: '#/components/schemas/Order'
+                retry_url:
+                  type: string
+                  format: uri
+                  description: Portal page where the merchant resolves the payment.
+
+    OrderChargedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [order, charge]
+              properties:
+                order:
+                  $ref: '#/components/schemas/Order'
+                charge:
+                  type: object
+                  required: [amount, currency, charged_at, invoice_url]
+                  properties:
+                    amount:
+                      description: Amount as charged, whole AED (AFS rounding rule).
+                      $ref: '#/components/schemas/DecimalAmount'
+                    currency:
+                      $ref: '#/components/schemas/CurrencyCode'
+                    charged_at: { type: string, format: date-time }
+                    invoice_url: { type: [string, 'null'], format: uri }
+
+    OrderShipmentEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [order, shipment]
+              properties:
+                order:
+                  $ref: '#/components/schemas/Order'
+                shipment:
+                  $ref: '#/components/schemas/Shipment'
+
+    ShipmentExceptionEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [order, shipment, kind]
+              properties:
+                order:
+                  $ref: '#/components/schemas/Order'
+                shipment:
+                  $ref: '#/components/schemas/Shipment'
+                kind:
+                  type: string
+                  x-extensible-enum: [returned, exception, on_hold]
+
+    Refund:
+      type: object
+      required: [status, amount, currency]
+      properties:
+        status:
+          type: string
+          x-extensible-enum: [none, pending, refunded]
+        amount:
+          description: Null when no money moved; never "0.00".
+          $ref: '#/components/schemas/NullableDecimalAmount'
+        currency:
+          $ref: '#/components/schemas/CurrencyCode'
+
+    OrderRefundEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [order, refund]
+              properties:
+                order:
+                  $ref: '#/components/schemas/Order'
+                refund:
+                  $ref: '#/components/schemas/Refund'
+
+    OrderCancelRejectedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [order, reason_code, message]
+              properties:
+                order:
+                  $ref: '#/components/schemas/Order'
+                reason_code:
+                  type: string
+                  description: Open value set.
+                  x-extensible-enum: [cancel_window_closed, payment_in_progress, production_started]
+                message: { type: string }
+
+    ReturnStatusChangedEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [order]
+              properties:
+                order:
+                  $ref: '#/components/schemas/Order'
+
+    ConnectionDisabledEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [reason]
+              properties:
+                reason:
+                  type: string
+                  x-extensible-enum: [plan_lapsed, disconnected, revoked, admin]
+
+    ApiKeyExpiringEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              required: [display_prefix, expires_at]
+              properties:
+                display_prefix: { type: string, description: "Display prefix of the key, never the key." }
+                expires_at: { type: string, format: date-time }
+
+    PingEvent:
+      allOf:
+        - $ref: '#/components/schemas/WebhookEnvelope'
+        - type: object
+          properties:
+            data:
+              type: object
+              description: Empty object.

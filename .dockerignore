@@ -1,0 +1,11 @@
+**/node_modules
+**/test
+artifacts
+notes
+.git
+starter/data
+.github
+scripts
+.env
+.env.*
+**/*.internal.md
