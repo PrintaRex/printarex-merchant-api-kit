@@ -119,4 +119,4 @@ HTML snapshot of a delivered order as build artifacts.
 ## Licence
 
 The code in this repository (sandbox, starter, scripts) is released under the [MIT licence](LICENSE).
-Use of the PrintaRex Merchant API itself is governed by the [PrintaRex API terms](https://printarex.com/terms).
+Use of the PrintaRex Merchant API itself is governed by the [PrintaRex Merchant API Terms](https://printarex.com/api-terms).

@@ -7,7 +7,7 @@ info:
     name: PrintaRex developer support
   license:
     name: PrintaRex API terms
-    url: https://printarex.com/terms
+    url: https://printarex.com/api-terms
   description: |
     The Merchant API lets a website that is not Shopify, WooCommerce, Amazon or Noon
     sell PrintaRex products. It is available on the **Premium** plan only.
